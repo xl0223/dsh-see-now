@@ -90,6 +90,75 @@ export const PACES_KEYS = Object.freeze(['calm', 'normal', 'dense', 'game-econom
  */
 export const PREFER_KEYS = Object.freeze(['auto', 'host', 'local']);
 
+/**
+ * `asr` 段：术语热词与错词表（见 hotwords.js）。
+ *
+ * 不写这个键 = 用内置那套（游戏/引擎常见术语 + 同音错写）。
+ * `hotwords: []` / `fixes: false` 是**明确关掉**，和"没配"不是一回事 ——
+ * 用户说"别给我加词"时，空数组是他唯一的表达方式。
+ */
+function readAsr(raw) {
+  const src = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
+  const out = { hotwords: null, fixes: null, autoFix: true };
+  const bad = [];
+
+  if (src.hotwords !== undefined) {
+    if (src.hotwords === false) out.hotwords = [];
+    else if (Array.isArray(src.hotwords)) {
+      out.hotwords = src.hotwords.map((s) => String(s ?? '').trim()).filter(Boolean);
+    } else if (typeof src.hotwords === 'string') {
+      out.hotwords = src.hotwords.split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean);
+    } else bad.push('asr.hotwords 只能是数组 / 逗号分隔字符串 / false');
+  }
+  if (src.fixes !== undefined) {
+    // false 要**原样**传到 hotwords.js 的 resolveAsrTerms（那里才决定合不合并）。
+    // 这里折成 {} 的话，会被当成「用户补了一张空表」→ 仍然合并内置表 = 关不掉。
+    if (src.fixes === false) out.fixes = false;
+    else if (src.fixes && typeof src.fixes === 'object' && !Array.isArray(src.fixes)) {
+      // 和内置表**合并**，不是替换：用户多半只想补几个自己的词，不想丢掉那一整套
+      out.fixes = {};
+      for (const [k, v] of Object.entries(src.fixes)) {
+        if (typeof k === 'string' && k.trim() && typeof v === 'string' && v.trim()) {
+          out.fixes[k.trim()] = v.trim();
+        }
+      }
+    } else bad.push('asr.fixes 只能是 {错词: 正词} 对象或 false');
+  }
+  if (src.autoFix !== undefined) {
+    if (typeof src.autoFix === 'boolean') out.autoFix = src.autoFix;
+    else bad.push('asr.autoFix 只能是 true / false');
+  }
+  return { asr: out, warnings: bad };
+}
+
+/**
+ * `crop` 段：变化区域特写的几何参数（见 crop.js / pipeline.js 的 crop* 默认值）。
+ *
+ * 只写用户真填的那几项 —— 没填的继续由 pipeline 的 DEFAULTS 兜，两边不重复抄默认值。
+ */
+function readCrop(raw) {
+  const src = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
+  const out = {};
+  const bad = [];
+
+  if (src.zoom !== undefined) {
+    if (typeof src.zoom === 'boolean') out.cropZoom = src.zoom;
+    else bad.push('crop.zoom 只能是 true / false');
+  }
+  const num = (key, min, max, target) => {
+    if (src[key] === undefined) return;
+    const want = Number(src[key]);
+    const ok = Number.isFinite(want) && want >= min && want <= max;
+    if (!ok) bad.push(`crop.${key} 必须在 ${min}–${max} 之间`);
+    if (ok) out[target] = want;
+  };
+  num('minArea', 0.001, 0.5, 'cropMinArea');
+  num('maxArea', 0.05, 1, 'cropMaxArea');
+  num('pad', 0, 2, 'cropPad');
+  num('minSide', 0.05, 1, 'cropMinSide');
+  return { crop: out, warnings: bad };
+}
+
 function dshHome(env) {
   return env.DSH_HOME || join(env.USERPROFILE || env.HOME || homedir(), '.dsh');
 }
@@ -216,6 +285,12 @@ export function readTuning({ env = process.env, readFile = readFileSync } = {}) 
   const listenCfg = readListen(raw.listen);
   warnings.push(...listenCfg.warnings);
 
+  const asrCfg = readAsr(raw.asr);
+  warnings.push(...asrCfg.warnings);
+
+  const cropCfg = readCrop(raw.crop);
+  warnings.push(...cropCfg.warnings);
+
   return {
     maxAutonomousWakes,
     idleStopMin,
@@ -225,6 +300,10 @@ export function readTuning({ env = process.env, readFile = readFileSync } = {}) 
     speechPacing,
     changeLog,
     listen: listenCfg.listen,
+    /** 术语热词与错词表。`null` 字段表示"用内置默认"，见 hotwords.js。 */
+    asr: asrCfg.asr,
+    /** 特写几何参数（只含用户真填的键，其余交给 pipeline 的 DEFAULTS）。 */
+    crop: cropCfg.crop,
     path,
     warnings,
   };

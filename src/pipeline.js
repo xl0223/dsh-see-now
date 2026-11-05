@@ -17,7 +17,7 @@
  *    只数切点会让档位永远 1 档、一张图只放 4 帧。见 tiers.js 的推导。
  */
 
-import { SCAN_H, SCAN_W, bgBorderChanged, bgKeep, createScorer, scorePair } from './cuts.js';
+import { SCAN_H, SCAN_W, bgBorderChanged, bgKeep, createScorer, hashDistance, scorePair } from './cuts.js';
 import { createTiers, applyStrategy } from './tiers.js';
 import { solve, toRects, splitOneBin } from './pack.js';
 import { composePacked, drawAudioStrip, stripHeight } from './sheet.js';
@@ -223,6 +223,21 @@ export const DEFAULTS = Object.freeze({
   floorMax: 20,
   /** 和上一张留下的帧差小于这个分就不留（0–255 刻度，见 cuts.js）。 */
   dupMin: 8,
+  /**
+   * ## 结构判重（dHash）
+   *
+   * `dupMin` 判的是「每个格子平均差多少」。一镜到底的素材（雨、树叶、卷云、噪点）
+   * 平均分 8~12 —— **过得了 dupMin**，于是每 25 秒能留 9 张几乎一样的画面。
+   * 但它们的**结构**一位都没动：9×8 灰度网格的 64 bit 完全一样。
+   *
+   * 所以再加一道：Hamming 距离 ≤ `dupHashDist` 且平均分 < `dupMin × dupHashScale`
+   * 时也判重。`dupHashDist: 0` 完全关掉这一道。
+   *
+   * 为什么还要带上平均分：结构哈希只看**相对亮度梯度**，两张完全不同的纯色图
+   * 会得到同一个全 0 的哈希（没有梯度）。带上平均分就挡住了这种退化情况。
+   */
+  dupHashDist: 2,
+  dupHashScale: 2,
 
   /**
    * 打分口径：'abs' = 逐格 HSV 差均值（历史行为）；'mc' = 运动补偿后的"变了多少格"占比（×255）。
@@ -463,6 +478,7 @@ export function createPipeline(opts = {}) {
   let sheetStart = 0;          // 本张第一帧的时刻（maxWaitSec 从这儿算）
 
   let lastKeptHsv = null;      // 上一张留下来的帧（去重基准）
+  let lastKeptHash = null;     // 同一帧的 64 位结构哈希（dHash 去重基准）
   let frames = [];             // 本张待发
   let sheets = [];
   /**
@@ -473,7 +489,7 @@ export function createPipeline(opts = {}) {
   const log = [];              // 每一帧为什么留下（离线标定用）
 
   const stats = {
-    frames: 0, kept: 0, cuts: 0, marks: 0, floors: 0, locals: 0, dupSkipped: 0,
+    frames: 0, kept: 0, cuts: 0, marks: 0, floors: 0, locals: 0, dupSkipped: 0, hashSkipped: 0,
     sheets: 0,
     scoreSum: 0, scoreN: 0, scoreMax: 0,
     /** 多箱兜底触发次数（>0 说明调用方没切干净，画面会被丢帧而不是糊掉） */
@@ -592,14 +608,27 @@ export function createPipeline(opts = {}) {
     let dup = null;
     if (lastKeptHsv && entry.hsv) dup = scorePair(lastKeptHsv, entry.hsv);
     /**
+     * 结构判重：画面**结构**一模一样时，不必要求平均分也低到 `dupMin`。
+     * 一镜到底的雨景平均分 8~12 过得了原阈值，但 64 bit 结构哈希一位没变 ——
+     * 那种帧拼进图里只是白占格子。
+     */
+    let hashDup = null;
+    if (lastKeptHash && entry.hash) hashDup = hashDistance(lastKeptHash, entry.hash);
+    const structurallySame = o.dupHashDist > 0
+      && hashDup !== null
+      && hashDup <= o.dupHashDist
+      && dup !== null
+      && dup < o.dupMin * o.dupHashScale;
+    /**
      * `local` 也豁免：它的整屏平均分**本来就很低**（这正是它存在的理由 ——
      * 改一个数值只有 0.1~0.5 分），拿平均分去重会把它自己挡在门外。
      * 实测：不加这条豁免时 local 事件 100% 被 dup 拦掉，等于这个功能没接上。
      */
-    if (dup !== null && dup < o.dupMin
+    if (dup !== null && (dup < o.dupMin || structurallySame)
       && via !== 'cut' && via !== 'floor' && via !== 'local'
       && !locallyDistinct(entry)) {
       stats.dupSkipped += 1;
+      if (structurallySame && dup >= o.dupMin) stats.hashSkipped += 1;
       return false;
     }
     tiers.mark(entry.t);
@@ -623,7 +652,10 @@ export function createPipeline(opts = {}) {
     if (entry.hsv) {
       lastKeptHsv ??= new Float32Array(entry.hsv.length);
       lastKeptHsv.set(entry.hsv);
-
+    }
+    if (entry.hash) {
+      lastKeptHash ??= new Uint8Array(8);
+      lastKeptHash.set(entry.hash);
     }
     log.push({
       t: +entry.t.toFixed(2), via, level: lv, tier, score: +(entry.score ?? 0).toFixed(1),
@@ -1117,7 +1149,7 @@ export function createPipeline(opts = {}) {
       // `wall` 是这一帧被处理时的墙上时间（epoch ms）。台词（ASR）只有时间码没有帧号，
       // 对齐只能靠同一个时钟 —— `t` 是"第几秒"，掉帧就漂，不能拿来对字幕。
       const entry = {
-        t, buf, score: s, peak: r.peak, hot: r.hot, hotBox: r.hotBox, mc: r.mcScore, mcBox: r.mcBox, mcRect: r.mcRect, mcFill: r.mcFill, mcSpanY: r.mcSpanY, activeY: r.activeY, guardY: r.guardY, bg: r.bgScore, bgStable: r.bgStable, bgChanged: r.bgChanged, bgModel: r.bgModel, futureModel: r.futureModel, prevHsv: r.prevHsv, prev: lastScore, hsv: Float32Array.from(r.hsv), wall: Date.now(),
+        t, buf, score: s, peak: r.peak, hot: r.hot, hotBox: r.hotBox, hash: r.hash, mc: r.mcScore, mcBox: r.mcBox, mcRect: r.mcRect, mcFill: r.mcFill, mcSpanY: r.mcSpanY, activeY: r.activeY, guardY: r.guardY, bg: r.bgScore, bgStable: r.bgStable, bgChanged: r.bgChanged, bgModel: r.bgModel, futureModel: r.futureModel, prevHsv: r.prevHsv, prev: lastScore, hsv: Float32Array.from(r.hsv), wall: Date.now(),
       };
       lastSeen = entry;
       lastScore = s;

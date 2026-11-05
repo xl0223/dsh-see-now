@@ -43,6 +43,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { LISTEN_DEFAULTS, PREFER_KEYS } from './tuning.js';
+import { applyFixes, hotwordString, resolveAsrTerms } from './hotwords.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const LISTEN_SCRIPT = join(HERE, '..', 'examples', 'floating-chat', 'listen.py');
@@ -277,14 +278,14 @@ function buildMultipart(fields, boundary) {
   parts.push(Buffer.from(`--${boundary}--\r\n`));
   return Buffer.concat(parts);
 }
-export function httpTranscriber(cfg, { timeoutMs = 30_000, log = () => {} } = {}) {  if (!cfg?.baseUrl) return null;
+export function httpTranscriber(cfg, { timeoutMs = 30_000, log = () => {}, hotword = '' } = {}) {  if (!cfg?.baseUrl) return null;
   const chat = cfg.api === 'chat-audio';
   return async function viaHttp(wav) {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), timeoutMs);
     try {
       const res = chat
-        ? await postChatAudio(cfg, wav, ac.signal, timeoutMs)
+        ? await postChatAudio(cfg, wav, ac.signal, timeoutMs, hotword)
         : await postOpenAiAudio(cfg, wav, ac.signal, timeoutMs);
       if (!res.ok) throw new Error(`HTTP ${res.status}：${(await res.text()).slice(0, 120)}`);
       const j = await res.json();
@@ -324,7 +325,7 @@ function postOpenAiAudio(cfg, wav, signal, timeoutMs) {
   });
 }
 
-function postChatAudio(cfg, wav, signal, timeoutMs) {
+function postChatAudio(cfg, wav, signal, timeoutMs, hotword = '') {
   const body = {
     model: cfg.model,
     messages: [
@@ -341,7 +342,17 @@ function postChatAudio(cfg, wav, signal, timeoutMs) {
       },
     ],
   };
-  if (cfg.language) body.asr_options = { language: cfg.language };
+  /**
+   * 热词走 `asr_options.hotword`（FunASR / paraformer 的 OpenAI 兼容层认这个）。
+   * **必须是逗号分隔的字符串**，发数组过去多数实现会静默忽略 —— 那种失效最难查：
+   * 界面一切正常，就是术语照样错。
+   */
+  if (cfg.language || hotword) {
+    body.asr_options = {
+      ...(cfg.language ? { language: cfg.language } : {}),
+      ...(hotword ? { hotword } : {}),
+    };
+  }
   const payload = Buffer.from(JSON.stringify(body), 'utf8');
   return send(`${cfg.baseUrl}/chat/completions`, {
     headers: {
@@ -427,8 +438,24 @@ export async function ensureService(cfg, { log = () => {}, waitMs = 60_000 } = {
  * （宿主 SenseVoice 走 CPU、70ms 级；自建服务往往在 GPU 上、带字级时间码）——
  * 悄悄回落到他没选的那个，比"没有字幕"更难查：界面显示在听，说的却不是他以为的那个引擎。
  */
-export function resolveTranscriber(ctx, { env = process.env, log = () => {}, prefer = 'auto' } = {}) {
+export function resolveTranscriber(ctx, {
+  env = process.env, log = () => {}, prefer = 'auto', asr = null,
+} = {}) {
   const want = PREFER_KEYS.includes(prefer) ? prefer : 'auto';
+  const terms = resolveAsrTerms(asr);
+  /** 热词只对 http 后端有意义（宿主没有对应接口）。 */
+  const hotword = hotwordString(terms.hotwords);
+
+  /**
+   * **错词表包在最外层**，而不是塞进 `httpTranscriber`。
+   *
+   * 因为它是唯一对**宿主后端也生效**的纠错手段 —— 宿主 SenseVoice 没有热词接口，
+   * 术语错了只能靠转写后的精确替换。包在这里，两条后端一视同仁。
+   */
+  const withFixes = (t) => {
+    if (!t || asr?.autoFix === false) return t;
+    return { ...t, transcribe: async (wav) => applyFixes(await t.transcribe(wav), terms.fixes) };
+  };
 
   const pickHost = () => {
     const fn = hostTranscriber(ctx);
@@ -439,13 +466,13 @@ export function resolveTranscriber(ctx, { env = process.env, log = () => {}, pre
     // 没配 baseUrl 就别造一个必然失败的转写器 —— 那种失败要等到第一次真请求才暴露，
     // 表现是"在听、0 句"，和"视频是默片"分不开
     if (!cfg) return null;
-    const fn = httpTranscriber(cfg, { log });
+    const fn = httpTranscriber(cfg, { log, hotword });
     return fn ? { kind: 'http', transcribe: fn, label: `本地 ${cfg.baseUrl}` } : null;
   };
 
-  if (want === 'host') return pickHost();
-  if (want === 'local') return pickLocal();
-  return pickHost() ?? pickLocal();
+  if (want === 'host') return withFixes(pickHost());
+  if (want === 'local') return withFixes(pickLocal());
+  return withFixes(pickHost() ?? pickLocal());
 }
 
 // ------------------------------------------------------------------ 静音窗口
@@ -652,6 +679,11 @@ export function createListener({
    * `pollMs` 留在这里（决定"多久扫一次目录"）。
    */
   listen = LISTEN_DEFAULTS,
+  /**
+   * 术语配置（`~/.dsh/see-now.json` 的 `asr` 段，见 hotwords.js）。
+   * `{hotwords, fixes, autoFix}`；不传就用内置那套游戏/引擎术语表。
+   */
+  asr = null,
   env = process.env, log = () => {}, pollMs = null,
   /**
    * 测试注入口：给一个转写器就完全不碰 `resolveTranscriber` / Python / 设备。
@@ -924,7 +956,7 @@ export function createListener({
       enabled = false;
       return { ok: false, reason };
     }
-    transcriber = injected ?? resolveTranscriber(ctx, { env, log, prefer: cfg.prefer });
+    transcriber = injected ?? resolveTranscriber(ctx, { env, log, prefer: cfg.prefer, asr });
     if (!transcriber) {
       // 指定了引擎就直说**是哪个**没到位 —— 指定模式下还说"没有可用的转写服务"等于没说
       reason = cfg.prefer === 'host'

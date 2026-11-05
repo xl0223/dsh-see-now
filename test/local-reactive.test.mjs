@@ -80,6 +80,29 @@ test('出图时把特写倍数写进清单元数据', () => {
   assert.ok(withZoom.every((f) => f.zoom >= 1), '倍数不可能小于 1');
 });
 
+test('结构没变、只是亮度跳了一档：dHash 拦下它', () => {
+  // 相邻两帧亮度 100 ↔ 130：整屏平均差 10（过得了 dupMin=8），
+  // 但结构一位没动（纯色没有梯度，dHash 全 0）—— 正是"一镜到底的雨景"那个形状。
+  const p = createPipeline({
+    width: W, height: H, fps: FPS, localEvent: 0, cropZoom: false, integralSeconds: 3,
+  });
+  for (let i = 0; i < 30; i += 1) {
+    p.push({ t: i / FPS, buf: Buffer.alloc(W * H * 3, i % 2 ? 130 : 100) });
+  }
+  assert.ok(p.stats.hashSkipped >= 1, `应该被结构判重拦下，实际 ${p.stats.hashSkipped}`);
+});
+
+test('dupHashDist: 0 完全关掉结构判重', () => {
+  const p = createPipeline({
+    width: W, height: H, fps: FPS, localEvent: 0, cropZoom: false, integralSeconds: 3,
+    dupHashDist: 0,
+  });
+  for (let i = 0; i < 30; i += 1) {
+    p.push({ t: i / FPS, buf: Buffer.alloc(W * H * 3, i % 2 ? 130 : 100) });
+  }
+  assert.equal(p.stats.hashSkipped, 0);
+});
+
 test('cropZoom:false 时退回到整帧缩放（老行为）', () => {
   const p = run({ extra: { localEvent: 60, cropZoom: false } });
   const { sheets } = p.finish();

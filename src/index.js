@@ -516,6 +516,9 @@ async function registerAll(ctx) {
     changeLog: tuning.changeLog,
     // 超省模式：攒够几张图才交（`wakeBatch`，默认 1 = 现在这样）
     wakeBatch: tuning.wakeBatch,
+    // 术语热词与错词表（`asr` 段）+ 特写几何（`crop` 段）
+    asr: tuning.asr,
+    crop: tuning.crop,
   });
   disposers.push(() => runner.stop());
 

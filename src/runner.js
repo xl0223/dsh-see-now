@@ -174,6 +174,16 @@ export function createRunner({
   /** `~/.dsh/see-now.json` 的 `changeLog`：交付时附「这期间屏幕怎么动的」摘要（默认关） */
   changeLog = false,
   /**
+   * `~/.dsh/see-now.json` 的 `asr` 段：术语热词与错词表（见 hotwords.js）。
+   * 只对「听声音」那条链生效 —— 没开声音时传什么都没影响。
+   */
+  asr = null,
+  /**
+   * `~/.dsh/see-now.json` 的 `crop` 段：变化区域特写的几何参数。
+   * 只含用户真填的键，没填的由 pipeline 的 DEFAULTS 兜（两边不重复抄默认值）。
+   */
+  crop = null,
+  /**
    * 叫醒时预留的那张图最多留多久（秒）。
    *
    * 模型压根没 `peek`（比如它回了一句话就收工）时，预留不能被无限占着 ——
@@ -244,7 +254,7 @@ export function createRunner({
    * 为什么在 runner 里而不是在工具层：它的生命周期和采集是同一个 ——
    * 开始看就开听，收工就停，中途换清晰度/换 region 也不用重启（音频跟画面无关）。
    */
-  const listener = createListener({ ctx, log, listen });
+  const listener = createListener({ ctx, log, listen, asr });
   /**
    * 上一张图的时间窗末尾（epoch ms）。台词按"上一张到现在"取，
    * 不能按这一张自己的 from/to —— 静止屏幕上两张之间隔 60 秒，中间说的话会整段漏掉。
@@ -484,6 +494,8 @@ export function createRunner({
       ...opts, width: w, height: h, ...regionOpts,
       // 变化日志是会话级偏好（配置项），不该被单次 watch 的 opts 覆盖
       changeLog,
+      // 特写几何同理：用户写在 see-now.json 里的值优先于 pipeline 默认，但**在 opts 之后**展开
+      ...(crop && typeof crop === 'object' ? crop : {}),
       /**
        * **队列能压几张 = 超省模式攒几张**。
        *

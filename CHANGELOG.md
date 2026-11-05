@@ -4,6 +4,31 @@
 
 ## [Unreleased]
 
+### Added — 结构判重、术语表、ffmpeg 路径解析、特写参数可配（本地改造 `0.1.2-see.2`）
+
+**① dHash 跨帧去重**（`cuts.js` 的 `dHash` / `hashDistance`）。`dupMin` 判的是
+「每个格子平均差多少」，而一镜到底的雨/树叶/卷云平均分 8~12 —— 过得了阈值，
+25 秒能留 9 张几乎一样的画面。结构哈希把「雨点在动」和「画面结构变了」拆开：
+9×8 灰度网格的 64 bit，Hamming ≤ `dupHashDist`（默认 2）且平均分 <
+`dupMin × dupHashScale`（默认 2）时判重。**带上平均分是必须的** ——
+两张纯色图都会得到全 0 的哈希（没有梯度），只看哈希会误杀。`dupHashDist: 0` 关掉。
+
+**② 术语表**（新模块 `hotwords.js`）。两条路：`hotword` 交给转写服务当解码提示
+（FunASR / paraformer 的 `asr_options.hotword`，必须是逗号分隔字符串，发数组会被静默忽略）；
+`fixes` 是转写后的**精确替换表**，**对宿主 SenseVoice 也生效** —— 那是唯一不依赖
+后端接口的纠错手段。默认那套是游戏/引擎术语（材质、蓝图、实例化、关键帧…），
+放在 `~/.dsh/see-now.json` 的 `asr` 段，不碰和 storyboard 共用的 `asr.json`。
+
+**③ ffmpeg 探测加 `where` / `which`**。GUI 启动的进程 PATH 常和终端不同
+（macOS 从 Dock 启动只有 `/usr/bin:/bin:/usr/sbin:/sbin`），裸名会 ENOENT 并伪装成
+"插件坏了"。现在先问系统要绝对路径，拿到就记进启动日志。
+
+**④ `crop` 参数可配**（`see-now.json` 的 `crop` 段 → `runner` → `pipeline`）。
+只传用户真填的键，其余由 pipeline 的 DEFAULTS 兜 —— 两边不重复抄默认值。
+
+测试 +22 条（`hotwords` 6 / `dhash` 7 / `tuning-asr-crop` 8 / 端到端 2）；
+全量 387 条 374 通过 0 失败 13 跳过。
+
 ### Added — 局部微变看得见：特写裁剪 + 一次性出口（本地改造 `0.1.2-see.1`）
 
 两个问题都出在「整屏平均分」这一个数上。
