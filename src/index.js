@@ -308,7 +308,10 @@ function sheetText(sheet, { waited = 0, partial = false, userText = null, say = 
     // 人以为"1 档 = 整幅"，而实际是 400×225（踩过：用户看到"1 档"配 400×225 以为算错了）。
     const k = cell ? Math.max(1, Math.round(sheet.w / Math.max(1, cell.pw))) : null;
     const tierText = k && k !== f.tier ? `${f.tier}档→1/${k}` : `${f.tier} 档`;
-    return `  ${i + 1}. ${f.t.toFixed(1)}s · ${size} · ${f.via} · ${tierText}`;
+    // 特写格要**明说**：它是「画面的一块放大」，不是「整屏长这样」。
+    // 不说的话模型会以为窗口只有那么大，判断布局时全错。
+    const zoomText = f.zoom ? ` · 特写${f.zoom}×` : '';
+    return `  ${i + 1}. ${f.t.toFixed(1)}s · ${size} · ${f.via} · ${tierText}${zoomText}`;
   });
   const whyText = why === 'user' ? '用户插话截断的'
     : why === 'timeout' ? '等满了先给你'

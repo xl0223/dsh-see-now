@@ -23,6 +23,7 @@ import { solve, toRects, splitOneBin } from './pack.js';
 import { composePacked, drawAudioStrip, stripHeight } from './sheet.js';
 import { encodePng } from './png.js';
 import { gridRects } from './layout.js';
+import { cropFrame, cropPlan } from './crop.js';
 
 export const DEFAULTS = Object.freeze({
   // 798 而不是 800：宽度向下对齐 42（patch 格），面积只少 0.25%，每张省 11 token。
@@ -302,6 +303,107 @@ export const DEFAULTS = Object.freeze({
    */
   audioStrip: true,
   audio: null,
+
+  /**
+   * ## 局部敏感（双尺度）
+   *
+   * `score` 是 2304 格的**平均值**，天生对局部失明：改一个数值、改一行代码、
+   * 弹出一行报错，整屏平均往往只有 0.1~0.5 分。而积分门槛是
+   * `REF_SCORE × fps × integralSeconds = 144`，按 0.3 分/帧 算要 **40 秒** ——
+   * 也就是说「AI 看到的是 40 秒前的画面」，这是实时视觉最要命的失真。
+   *
+   * 这里补一路局部读数（`scorePairDetail` 顺带算出的 `peak` / `hot`）：
+   *   - `localPeakMin`：单格最大差到多少才开始给加成（0–255 刻度）
+   *   - `localMinCells`：至少铺开多少格才算「内容变了」而不是光标/插入符
+   *   - `localBoost`：每多 1 分峰值折算多少积分（0 = 整个加成关掉）
+   *
+   * 光标是小面积高幅度，文字/数值改动也是小面积 —— 单看 `peak` 分不开，
+   * 所以要求 `hot`（超阈值格数）一起过关，并且 `localEventGap` 之外才给一次性出口。
+   */
+  /**
+   * **默认 0（关）**。
+   *
+   * 一开始它和 `localEvent` 一起默认开着（0.6），结果把"持续运动"也加速了：
+   * 动图/视频/合成图案在降采样到 64×36 之后，局部判据 `isLocalChange` 会
+   * 时真时假地穿过，积分被额外推 40 分/帧 —— 原来 3 秒一个采样点变成 0.5 秒，
+   * 实测让两个既有测试直接红（`peek-minframes`、`boost`）。
+   *
+   * 结论：**积分的活交给积分**。一次性变化走 `localEvent`（它靠 `localCalmFrames`
+   * 要求前面静止过，天然排除持续运动）。需要为"连续小改动"额外加速时再打开这个开关。
+   */
+  localBoost: 0,
+  localPeakMin: 40,
+  /**
+   * 至少铺开多少格。实测（798×450 真实截图，64×36 网格）：
+   *   80×30 白块 → hot=20   60×24 白块 → hot=10   80×30 黑块 → hot=12
+   *   20×12 白块 → hot=2（一个大字符的量级）
+   * 光标块是 1~2 格。取 4：挡住光标和单个字符，放过"一行数值"。
+   */
+  localMinCells: 4,
+  /**
+   * 变化格数的**上界**（2304 格里占多少）。超过就是「整屏都在动」，不是局部变化 ——
+   * 那种画面本来就由积分管，加成只会把「3 秒一个采样点」压到 0.5 秒，
+   * 帧数翻几倍但信息量不变（实测：漏掉这条会让 `testsrc2` 这类动图素材立刻封箱）。
+   *
+   * 120 格 ≈ 画面 5.2%。一个属性面板的数值改动通常在 10~60 格。
+   */
+  localMaxCells: 120,
+  /**
+   * 「局部变化」要求画面**大面积为静态背景**（稳定格数 ≥ 这个值，2304 格里）。
+   *
+   * 这是最本质的那条区分：改一个数值、改一行代码，画面 90% 静止、只动一小块；
+   * 而游戏、视频、合成测试图案**整屏都在动**，稳定背景格很少。
+   * `bgStats` 每帧都在算这个数（最近 6 帧里一直没怎么动的格），直接拿来用。
+   *
+   * 600 ≈ 26% 画面。编辑器/文档/表格类工作流通常在 70% 以上。
+   */
+  localMinStable: 600,
+  /**
+   * 局部强变化的**一次性出口**：`peak ≥ localEvent` 且 `hot ≥ localMinCells` 时
+   * 立刻留一帧，不等积分。0 = 关闭。`localEventGap` 是不应期（秒）——
+   * 持续的小改动不会把帧刷爆（那是积分的活）。
+   */
+  /**
+   * 一次性出口的峰值门槛。实测同一批截图（798×450，64×36 网格）：
+   *   80×30 白块 peak=116.7、80×30 黑块 peak=85.5、20×12 白块 peak=96.2
+   * 而它们的**整屏平均**只有 0.37~0.65 —— 按积分算要 18~32 秒才出帧。
+   * 取 70：常见的内容改动都过得了，又离「整屏运动」（hot 上界那条）很远。
+   */
+  localEvent: 70,
+  localEventGap: 1.0,
+  /**
+   * 触发一次性出口前，画面得**安静过**这么多帧（12fps 下 6 帧 = 0.5 秒）。
+   *
+   * 为什么需要：持续运动（游戏、视频、合成测试图案）同样满足
+   * 「peak 很猛 + 铺开很多格」—— 光看这两个数，它们和「改了一个数值」一模一样。
+   * 真实区别在**上下文**：一次性改动发生在一段静止之后，持续运动则前面一直在动。
+   * 实测漏掉这条时，`testsrc2` 这种动图素材每 1 秒就多留一帧（原有测试直接红）。
+   */
+  localCalmFrames: 6,
+
+  /**
+   * ## 变化区域特写
+   *
+   * `mcStats` 早就在返回 `box`（「刚才哪里变了」，64×36 网格坐标），但过去只用来
+   * 写变化日志。这里把它接到出图上：变化区域只占一小块时，以它为中心裁一块
+   * **原分辨率**铺进格子 —— 4 帧图里每帧只有 ~398×225，裁出来等效放大 2~3 倍，
+   * 引擎面板的数值、代码的行、报错的红字才看得清。
+   *
+   * 面积门槛与边界见 `crop.js`。`cropZoom: false` 完全回到整帧缩放。
+   */
+  cropZoom: true,
+  /**
+   * 变化区域占全画面的**下限**才值得裁。0.5%。
+   *
+   * 一开始写 2%，实测偏严：一个属性数值的改动只有 10~40 格（0.4%~1.7%），
+   * 正好卡在门外 —— 而它恰恰是最需要特写的那一类。光标约 0.07%，仍在下方。
+   */
+  cropMinArea: 0.005,
+  cropMaxArea: 0.5,
+  cropPad: 0.25,
+  cropMinSide: 0.25,
+  /** 单格算「热」的门槛（0–255），只影响 `hot` 读数，不参与切点判定。 */
+  hotTau: 24,
 });
 
 /**
@@ -336,6 +438,7 @@ export function createPipeline(opts = {}) {
     width, height, scoreMode: o.scoreMode, mcTau: o.mcTau, mcRadius: o.mcRadius,
     gateMcRadius: o.cutMcRadius, bgWindow: o.cutBgWindow, bgModel: o.cutFutureDelay > 0,
     bgRefWindow: o.cutFutureDelay > 0 ? o.cutFutureRefWindow : 0,
+    hotTau: o.hotTau,
     futureMinScore: o.cutFutureDelay > 0
       ? Math.min(o.cutFutureMinScore, o.cutFutureBuildMinScore)
       : o.cutFutureMinScore,
@@ -349,6 +452,10 @@ export function createPipeline(opts = {}) {
   let acc = 0;                 // 积分累加
   let lastCut = -Infinity;
   let lastBound = -Infinity;
+  /** 上一次「局部强变化」立刻留帧的时刻（不应期用，见 localEventGap）。 */
+  let lastLocalEvent = -Infinity;
+  /** 连续多少帧「局部不猛」——一次性出口要求这段静止先成立，用来把持续运动挡在外面。 */
+  let calmRun = 0;
   /** 近期"出帧间隔"的滑动平均（按节奏自适应兜底用） */
   let gapEwma = 0;
   let lastKeepT = null;
@@ -366,7 +473,7 @@ export function createPipeline(opts = {}) {
   const log = [];              // 每一帧为什么留下（离线标定用）
 
   const stats = {
-    frames: 0, kept: 0, cuts: 0, marks: 0, floors: 0, dupSkipped: 0,
+    frames: 0, kept: 0, cuts: 0, marks: 0, floors: 0, locals: 0, dupSkipped: 0,
     sheets: 0,
     scoreSum: 0, scoreN: 0, scoreMax: 0,
     /** 多箱兜底触发次数（>0 说明调用方没切干净，画面会被丢帧而不是糊掉） */
@@ -431,13 +538,67 @@ export function createPipeline(opts = {}) {
     return REF_SCORE * fps * o.integralSeconds;
   }
 
+  /**
+   * 局部变化的积分加成：`peak` 超过起算点的部分，按 `localBoost` 折算。
+   *
+   * 为什么不能只看 `score`：那是 2304 格的平均值。游戏引擎里改一个数值、
+   * 代码里改一行，整屏平均 0.1~0.5 分，按积分门槛 144 算要 40 秒才出帧。
+   * `peak`（单格最大差）在同一帧上能到 80~150，这一路把「局部但够猛」接进来。
+   *
+   * 为什么还得看 `hot`：光标/插入符也是小面积高幅度。要求变化至少铺开
+   * `localMinCells` 格（约 0.26% 画面），一个光标块通常 1~2 格。
+   *
+   * @returns {number} 这一帧额外贡献的积分（≥0）
+   */
+  /**
+   * 这一帧虽然**整屏平均差很小**，但局部有实打实的变化。
+   *
+   * 去重（`dupMin`）用的是 `scorePair` 的整屏平均分，而它对局部失明：
+   * 一个数值改动的平均分只有 0.1~0.5，比 dupMin 低一个数量级 ——
+   * 于是"每帧都在改同一个面板"会被判成"画面没变"，全部丢掉。
+   * 局部读数够强时放过它。
+   */
+  function locallyDistinct(entry) {
+    if (!(o.localBoost > 0) && !(o.localEvent > 0)) return false;
+    return isLocalChange(entry);
+  }
+
+  /**
+   * 「这一帧是局部变化」的统一判据：够猛、铺开够多、但**没铺满整屏**。
+   *
+   * 四个条件缺一不可 —— 少了任何一个，动图/视频/合成测试图案都会命中，
+   * 而那类画面本来就有积分在管（实测：`testsrc2` 会让"帧数够了就压档"直接红）。
+   * 最关键是最后一条：**画面得大面积为静态**，只动一小块才算「局部」。
+   */
+  function isLocalChange(entry) {
+    const peak = entry.peak ?? 0;
+    const hot = entry.hot ?? 0;
+    const stable = entry.bgStable ?? 0;
+    return peak >= o.localPeakMin
+      && hot >= o.localMinCells
+      && hot <= o.localMaxCells
+      && stable >= o.localMinStable;
+  }
+
+  function localSignal(entry) {
+    if (!(o.localBoost > 0) || !isLocalChange(entry)) return 0;
+    return o.localBoost * ((entry.peak ?? 0) - o.localPeakMin);
+  }
+
   function keep(entry, via) {
     // 去重：和**上一张留下来的帧**太像就不留。一镜到底的素材没有切点，积分会被
     // 雨点/树叶/传感器噪声推着一直触发，25 秒能留 9 张几乎一样的画面。
     // cut / floor 不过这道闸：切点本来就是新画面，floor 是兜底不能吞。
     let dup = null;
     if (lastKeptHsv && entry.hsv) dup = scorePair(lastKeptHsv, entry.hsv);
-    if (dup !== null && dup < o.dupMin && via !== 'cut' && via !== 'floor') {
+    /**
+     * `local` 也豁免：它的整屏平均分**本来就很低**（这正是它存在的理由 ——
+     * 改一个数值只有 0.1~0.5 分），拿平均分去重会把它自己挡在门外。
+     * 实测：不加这条豁免时 local 事件 100% 被 dup 拦掉，等于这个功能没接上。
+     */
+    if (dup !== null && dup < o.dupMin
+      && via !== 'cut' && via !== 'floor' && via !== 'local'
+      && !locallyDistinct(entry)) {
       stats.dupSkipped += 1;
       return false;
     }
@@ -453,6 +614,11 @@ export function createPipeline(opts = {}) {
     frames.push({
       t: entry.t, buf: entry.buf, tier, via, level: lv, wall: entry.wall,
       score: entry.score, mcRect: entry.mcRect,
+      // 出图时 crop.js 用 **hotBox**（绝对差的热区）裁特写 —— 不能用 mcRect，
+      // 那是运动补偿后的框，均匀色块/整行新文字会被邻域匹配吞成空框。
+      // mcRect 仍然保留，给 noteChange 的变化日志用。
+      hotBox: entry.hotBox ?? null,
+      peak: entry.peak ?? 0, hot: entry.hot ?? 0,
     });
     if (entry.hsv) {
       lastKeptHsv ??= new Float32Array(entry.hsv.length);
@@ -462,6 +628,7 @@ export function createPipeline(opts = {}) {
     log.push({
       t: +entry.t.toFixed(2), via, level: lv, tier, score: +(entry.score ?? 0).toFixed(1),
       dup: dup === null ? null : +dup.toFixed(1),
+      peak: +(entry.peak ?? 0).toFixed(1), hot: entry.hot ?? 0,
     });
     lastBound = entry.t;
     if (via === 'cut') cutTimes.push(+entry.t.toFixed(2));
@@ -474,6 +641,7 @@ export function createPipeline(opts = {}) {
     if (via === 'cut') stats.cuts += 1;
     else if (via === 'mark') stats.marks += 1;
     else if (via === 'floor') stats.floors += 1;
+    else if (via === 'local') stats.locals += 1;
     // 一次性：留下第一帧就立刻发，不等判据
     if (o.oneShot && frames.length === 1) { o.oneShot = false; flush(entry.t, 'oneshot'); return true; }
     checkFlush(entry.t);
@@ -681,7 +849,30 @@ export function createPipeline(opts = {}) {
      * 旧链路是「每格 alloc 中间缓冲 → coverInto → blit 到画布」，等于每格多做
      * 一次 267KB 的分配和一次同样大小的拷贝；4 格图纯搬运就是 1MB。现在零中间缓冲。
      */
-    const cells = used.map((f) => ({ src: f.buf, sw: width, sh: height }));
+    /**
+     * **变化区域特写**。
+     *
+     * `mcRect` 是「刚才哪里变了」（64×36 网格坐标），过去只写进变化日志。
+     * 这里把它接到出图上：变化区域只占一小块时，以它为中心裁一块原分辨率铺进格子。
+     * 4 帧图的每帧只有 ~398×225，裁出来等效放大 2~3 倍 —— 引擎面板的数值、
+     * 代码的行、报错的红字这才看得清。边界条件全在 `crop.js`（太小/太大都不裁）。
+     *
+     * 裁切是为了**看得清**，不是省 token：格子大小由行的档位决定，裁与不裁一样大。
+     */
+    const crops = used.map((f, i) => {
+      if (!o.cropZoom) return null;
+      const r = rects[i];
+      if (!r) return null;
+      return cropPlan(f.hotBox ?? f.mcRect, width, height, Math.max(1, r.pw - 1), Math.max(1, r.ph - 1), {
+        minArea: o.cropMinArea, maxArea: o.cropMaxArea, pad: o.cropPad, minSide: o.cropMinSide,
+      });
+    });
+    const cells = used.map((f, i) => {
+      const c = crops[i];
+      if (!c) return { src: f.buf, sw: width, sh: height };
+      const cut = cropFrame(f.buf, width, height, c);
+      return { src: cut.buf, sw: cut.w, sh: cut.h };
+    });
     const stripH = stripHeightFor();
     const img = composePacked({
       frames: cells, rects, width, height, burn: 'index', stripH,
@@ -712,6 +903,10 @@ export function createPipeline(opts = {}) {
       wallTo: used[used.length - 1].wall ?? null,
       frames: used.map((f, i) => ({
         t: +f.t.toFixed(2), tier: seq[i], level: f.level, via: f.via, wall: f.wall ?? null,
+        // 这一格是特写时给倍数（源宽 / 裁切宽），清单里要标出来 —— 否则模型会把
+        // 「放大的一块」误当成「整屏就是这样」。null = 整帧缩放。
+        zoom: crops[i] ? +(width / crops[i].w).toFixed(1) : null,
+        cropArea: crops[i] ? +crops[i].area.toFixed(3) : null,
       })),
       cells: rects.map((r) => ({ px: r.px, py: r.py, pw: r.pw, ph: r.ph, tier: r.t })),
     });
@@ -869,7 +1064,35 @@ export function createPipeline(opts = {}) {
       return;
     }
 
-    acc += s;
+    /**
+     * **局部强变化的一次性出口**。
+     *
+     * 积分是给「持续运动」设计的：每帧 4 分 × 12fps × 3 秒 = 144 才够一个采样点。
+     * 而「改了一个数值 / 改了一行代码 / 弹出一行报错」这类变化**只发生一次**，
+     * 之后画面就停住了，永远不会被积分攒出来 —— 实测要 40 秒。
+     *
+     * 所以给一路一次性出口：单格最大差 `peak` 够猛、且变化铺开 `localMinCells`
+     * 格以上，直接留一帧。`localEventGap` 是不应期，防止连续小改动把帧数刷爆
+     * （那些本来就归积分管）。
+     */
+    const peak = entry.peak ?? 0;
+    const hot = entry.hot ?? 0;
+    // 「刚才安静过多久」要在这一帧之前取：变化帧自己会把 calmRun 清零
+    const wasCalm = calmRun;
+    if (peak < o.localPeakMin) calmRun += 1;
+    else calmRun = 0;
+    if (o.localEvent > 0
+      && wasCalm >= o.localCalmFrames
+      && peak >= o.localEvent
+      && isLocalChange(entry)
+      && entry.t - lastLocalEvent >= o.localEventGap
+      && keep(entry, 'local')) {
+      lastLocalEvent = entry.t;
+      acc = 0;
+      return;
+    }
+
+    acc += s + localSignal(entry);
     if (acc >= integralNeed() && entry.t - lastBound >= o.markMinGap) {
       // 只有**真的录进去**才清零。被去重挡掉时保留累积值 —— 否则这一段的运动量
       // 白攒了，下一个采样点要重新等一整轮（实测会让出帧间隔凭空翻倍）。
@@ -894,7 +1117,7 @@ export function createPipeline(opts = {}) {
       // `wall` 是这一帧被处理时的墙上时间（epoch ms）。台词（ASR）只有时间码没有帧号，
       // 对齐只能靠同一个时钟 —— `t` 是"第几秒"，掉帧就漂，不能拿来对字幕。
       const entry = {
-        t, buf, score: s, mc: r.mcScore, mcBox: r.mcBox, mcRect: r.mcRect, mcFill: r.mcFill, mcSpanY: r.mcSpanY, activeY: r.activeY, guardY: r.guardY, bg: r.bgScore, bgStable: r.bgStable, bgChanged: r.bgChanged, bgModel: r.bgModel, futureModel: r.futureModel, prevHsv: r.prevHsv, prev: lastScore, hsv: Float32Array.from(r.hsv), wall: Date.now(),
+        t, buf, score: s, peak: r.peak, hot: r.hot, hotBox: r.hotBox, mc: r.mcScore, mcBox: r.mcBox, mcRect: r.mcRect, mcFill: r.mcFill, mcSpanY: r.mcSpanY, activeY: r.activeY, guardY: r.guardY, bg: r.bgScore, bgStable: r.bgStable, bgChanged: r.bgChanged, bgModel: r.bgModel, futureModel: r.futureModel, prevHsv: r.prevHsv, prev: lastScore, hsv: Float32Array.from(r.hsv), wall: Date.now(),
       };
       lastSeen = entry;
       lastScore = s;

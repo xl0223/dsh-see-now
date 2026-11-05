@@ -80,6 +80,76 @@ export function scorePair(prev, cur) {
 }
 
 /**
+ * 同一个分数的**第二种读法**：除了「整屏平均变了多少」，还给出「最狠的那一格变了多少」。
+ *
+ * ## 为什么需要
+ *
+ * `scorePair` 返回的是 2304 个格子的平均值。**平均值天生对局部失明**：
+ * 游戏引擎里把一个数值 100 改成 99、代码里改一行、报错弹出一行红字 ——
+ * 整屏平均分往往 0.1~0.5（实测标定见 README 的刻度表：滚网页才 30~42）。
+ * 而积分的门槛是 `REF_SCORE × fps × integralSeconds = 144`，
+ * 按 0.3 分/帧 算要 **40 秒**才攒够一个采样点 —— 也就是说这类改动
+ * 「AI 看到的是 40 秒前的画面」。
+ *
+ * 所以额外统计两件事：
+ *   - **`peak`**：单格最大差（三通道平均，和 `score` 同刻度）。回答「变化有多猛」。
+ *   - **`hot`**：超过 `hotTau` 的格数。回答「变化占了多少地方」。
+ *
+ * 光标是小面积、高幅度；文字/数值改动同样是小面积 —— **光靠 `peak` 分不开**,
+ * 所以上层把 `hot` 一起当条件用，并且只在「够猛且够多」时才加成（见 pipeline 的
+ * `localSignal`）。这两个数不改变 `score` 的任何一个 bit，纯属额外读数。
+ *
+ * @param {Float32Array} prev 上一帧 HSV 网格
+ * @param {Float32Array} cur 当前帧 HSV 网格
+ * @param {{hotTau?:number}} [opts] 单格算「热」的门槛（0–255 刻度）
+ * @returns {{score:number, peak:number, hot:number}} `score` 与 `scorePair` 逐位相同
+ */
+export function scorePairDetail(prev, cur, { hotTau = 24 } = {}) {
+  let sum = 0;
+  let peak = 0;
+  let hot = 0;
+  let minX = SCAN_W;
+  let minY = SCAN_H;
+  let maxX = -1;
+  let maxY = -1;
+  for (let i = 0; i < cur.length; i += 3) {
+    const dh = Math.abs(cur[i] - prev[i]);
+    const hueDiff = Math.min(dh, 255 - dh);
+    const hueWeight = Math.min(cur[i + 1], prev[i + 1]) / 255;
+    const d = hueDiff * hueWeight
+      + Math.abs(cur[i + 1] - prev[i + 1])
+      + Math.abs(cur[i + 2] - prev[i + 2]);
+    sum += d;
+    const dd = d / 3;
+    if (dd > peak) peak = dd;
+    if (dd > hotTau) {
+      hot += 1;
+      const c = i / 3;
+      const x = c % SCAN_W;
+      const y = (c / SCAN_W) | 0;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+  }
+  return {
+    score: sum / ((cur.length / 3) * 3),
+    peak,
+    hot,
+    /**
+     * **绝对差的热区包围框**（网格坐标，含端点）。`null` = 没有超门槛的格。
+     *
+     * 与 `mcStats` 的 `box` 不是一回事：那个是**运动补偿后**仍然变的格，
+     * 用于判切点（整屏平移能被邻域吸收）。特写要的是「画面上真的变了的地方」，
+     * 不能过运动补偿 —— 否则一块均匀的弹窗、一整行新文字会被邻域匹配吞掉，
+     * 裁出来是空框（实测：60×40 的均匀色块在 radius=4 下被完全吸收）。
+     */
+    box: hot === 0 ? null : { x0: minX, y0: minY, x1: maxX, y1: maxY },
+  };
+}
+
+/**
  * 打分器：内部维护上一帧的 HSV。
  * 返回 `{ score, hsv }`，score 为 null 表示这是第一帧（没有前帧可比）。
  * **hsv 是复用的缓冲**，要用就自己拷走。
@@ -318,6 +388,8 @@ export function createScorer({
   width, height, scoreMode = 'abs', mcTau = 15, mcRadius = 2, gateMcRadius = mcRadius,
   bgWindow = 6, bgStableRange = 24, bgTau = 15, bgModel = false,
   bgRefWindow = 0, futureMinScore = Infinity,
+  /** 单格算「热」的门槛（0–255）。只影响 `hot` 这个读数，不参与切点判定。 */
+  hotTau = 24,
 }) {
   const n = SCAN_W * SCAN_H;
   const rgb = new Float32Array(n * 3);
@@ -330,6 +402,9 @@ export function createScorer({
     gridRgb(frame, width, height, rgb);
     rgbToHsv(rgb, cur);
     let s = null;
+    let peak = 0;
+    let hot = 0;
+    let hotBox = null;
     let mcScore = null;
     let mcBox = null;
     let mcRect = null;
@@ -361,7 +436,13 @@ export function createScorer({
           ? mcScore
           : mcRatioScore(prev, cur, { tau: mcTau, radius: mcRadius });
       } else {
-        s = scorePair(prev, cur);
+        // **同一份循环**里顺手统计 peak/hot：scorePair 与 scorePairDetail 的分数逐位相同，
+        // 换成它会多出两个读数但不改任何一个已有行为（见 test/local-score.test.mjs）。
+        const d = scorePairDetail(prev, cur, { hotTau });
+        s = d.score;
+        peak = d.peak;
+        hot = d.hot;
+        hotBox = d.box;
       }
     }
     if (bgRefWindow > 0
@@ -388,7 +469,7 @@ export function createScorer({
       if (refHistory.length > bgRefWindow) refHistory.shift();
     }
     return {
-      score: s, mcScore, mcBox, mcRect, mcFill, mcSpanY, activeY, guardY, bgScore, bgStable, bgChanged,
+      score: s, peak, hot, hotBox, mcScore, mcBox, mcRect, mcFill, mcSpanY, activeY, guardY, bgScore, bgStable, bgChanged,
       bgModel: bgModelOut, futureModel, prevHsv, hsv: cur,
     };
   };
