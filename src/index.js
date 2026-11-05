@@ -519,6 +519,8 @@ async function registerAll(ctx) {
     // 术语热词与错词表（`asr` 段）+ 特写几何（`crop` 段）
     asr: tuning.asr,
     crop: tuning.crop,
+    local: tuning.local,
+    dedup: tuning.dedup,
   });
   disposers.push(() => runner.stop());
 

@@ -46,6 +46,15 @@ function defaultsPayload() {
     ...TUNING_DEFAULTS,
     idleStopMs: TUNING_DEFAULTS.idleStopMin * 60 * 1000,
     listen: { ...LISTEN_DEFAULTS },
+    /**
+     * 本地加的四段。这些默认值**必须和 pipeline / hotwords 那边逐字一致** ——
+     * 不一致的话，用户在面板上看到 0.005、实际跑的是别的数，会以为改了没生效。
+     */
+    crop: { zoom: true, minArea: 0.005, maxArea: 0.5, pad: 0.25, minSide: 0.25 },
+    /** `null` = 用内置那套（游戏/引擎术语 + 33 条同音纠错），见 hotwords.js。 */
+    asr: { hotwords: null, fixes: null, autoFix: true },
+    local: { event: 70, minCells: 4, peakMin: 40, boost: 0, calmFrames: 6, maxCells: 120 },
+    dedup: { min: 8, hashDist: 2, hashScale: 2 },
   };
 }
 

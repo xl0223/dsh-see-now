@@ -66,3 +66,42 @@ test('crop 越界 → 不写进覆盖，并留 warning', () => {
   assert.ok(t.warnings.some((w) => w.includes('crop.minArea')));
   assert.ok(t.warnings.some((w) => w.includes('crop.maxArea')));
 });
+
+test('local 段：键名映射到 pipeline 认的那几个', () => {
+  const t = readTuning({
+    env: ENV,
+    readFile: readJson({
+      local: { event: 0, minCells: 8, peakMin: 50, boost: 1.2, calmFrames: 10, maxCells: 200 },
+    }),
+  });
+  assert.deepEqual(t.local, {
+    localEvent: 0,
+    localMinCells: 8,
+    localPeakMin: 50,
+    localBoost: 1.2,
+    localCalmFrames: 10,
+    localMaxCells: 200,
+  });
+});
+
+test('local 越界 → 不写进覆盖并警告；event: 0 是合法值（关掉）', () => {
+  const bad = readTuning({ env: ENV, readFile: readJson({ local: { event: 999, boost: -1 } }) });
+  assert.deepEqual(bad.local, {});
+  assert.ok(bad.warnings.some((w) => w.includes('local.event')));
+  assert.ok(bad.warnings.some((w) => w.includes('local.boost')));
+
+  const off = readTuning({ env: ENV, readFile: readJson({ local: { event: 0 } }) });
+  assert.deepEqual(off.local, { localEvent: 0 }, '0 要能写进去 —— 它是"关掉"的表达方式');
+});
+
+test('dedup 段：三个阈值，hashDist: 0 是合法值（关掉结构判重）', () => {
+  const t = readTuning({ env: ENV, readFile: readJson({ dedup: { min: 4, hashDist: 0, hashScale: 3 } }) });
+  assert.deepEqual(t.dedup, { dupMin: 4, dupHashDist: 0, dupHashScale: 3 });
+});
+
+test('dedup 越界 → 不写进覆盖并警告', () => {
+  const t = readTuning({ env: ENV, readFile: readJson({ dedup: { min: -1, hashScale: 99 } }) });
+  assert.deepEqual(t.dedup, {});
+  assert.ok(t.warnings.some((w) => w.includes('dedup.min')));
+  assert.ok(t.warnings.some((w) => w.includes('dedup.hashScale')));
+});

@@ -4,6 +4,28 @@
 
 ## [Unreleased]
 
+### Added — 四段配置全部可改（本地改造 `0.1.2-see.3`）
+
+上一版只把 `crop` 和 `asr` 接到了 `see-now.json`，`local` / `dedup` 还锁在源码里。
+这一版补齐，并把这四段加进设置面板的白名单（`WRITABLE_KEYS`）：
+
+```json
+{
+  "crop":  { "zoom": true, "minArea": 0.005, "maxArea": 0.5, "pad": 0.25 },
+  "asr":   { "hotwords": ["材质"], "fixes": { "才质": "材质" }, "autoFix": true },
+  "local": { "event": 70, "minCells": 4, "peakMin": 40, "boost": 0, "calmFrames": 6, "maxCells": 120 },
+  "dedup": { "min": 8, "hashDist": 2, "hashScale": 2 }
+}
+```
+
+`0` 和 `false` 都是**合法的关闭值**（`local.event: 0`、`dedup.hashDist: 0`、`asr.fixes: false`），
+和"没配"不是一回事 —— 测试专门盯着这条。
+
+设置面板的 `defaultsPayload` 也补上了这四段，且默认值必须和 pipeline / hotwords 那边逐字一致，
+否则用户看到 0.005、实际跑的是别的数。
+
+测试 +5 条（`local` / `dedup` 的解析与越界）；全量 392 条 379 通过 0 失败 13 跳过。
+
 ### Added — 结构判重、术语表、ffmpeg 路径解析、特写参数可配（本地改造 `0.1.2-see.2`）
 
 **① dHash 跨帧去重**（`cuts.js` 的 `dHash` / `hashDistance`）。`dupMin` 判的是

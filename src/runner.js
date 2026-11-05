@@ -199,6 +199,10 @@ export function createRunner({
    * 模型还是得一轮一轮来。
    */
   wakeBatch = 1,
+  /** `~/.dsh/see-now.json` 的 `local` 段：局部敏感参数（见 pipeline.js 的 local*）。 */
+  local = null,
+  /** `~/.dsh/see-now.json` 的 `dedup` 段：跨帧去重阈值（dupMin / dupHashDist）。 */
+  dedup = null,
 } = {}) {
   let pipeline = null;   // 当前（或刚停的）引擎 —— 停采集后仍留着，好把队列里剩的图发完
   let running = false;
@@ -496,6 +500,8 @@ export function createRunner({
       changeLog,
       // 特写几何同理：用户写在 see-now.json 里的值优先于 pipeline 默认，但**在 opts 之后**展开
       ...(crop && typeof crop === 'object' ? crop : {}),
+      ...(local && typeof local === 'object' ? local : {}),
+      ...(dedup && typeof dedup === 'object' ? dedup : {}),
       /**
        * **队列能压几张 = 超省模式攒几张**。
        *

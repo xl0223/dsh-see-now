@@ -159,6 +159,64 @@ function readCrop(raw) {
   return { crop: out, warnings: bad };
 }
 
+/**
+ * `local` 段：局部敏感（见 pipeline.js 的 localEvent / localPeakMin 等）。
+ *
+ * 默认值就是"改一个数值能在一秒内出现在图上"的那一档；调低会更吵，调高会更迟钝。
+ * 只写用户真填的键 —— 没填的继续由 pipeline 的 DEFAULTS 兜。
+ */
+function readLocal(raw) {
+  const src = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
+  const out = {};
+  const bad = [];
+  const int = (key, min, max, target, unit = '') => {
+    if (src[key] === undefined) return;
+    const n = Number(src[key]);
+    const ok = Number.isInteger(n) && n >= min && n <= max;
+    if (!ok) bad.push(`local.${key} 必须是 ${min}–${max} 的整数${unit}`);
+    if (ok) out[target] = n;
+  };
+  int('event', 0, 255, 'localEvent', '（0 = 关掉一次性出口）');
+  int('minCells', 0, 200, 'localMinCells', '（格）');
+  int('peakMin', 0, 255, 'localPeakMin');
+  int('calmFrames', 0, 60, 'localCalmFrames', '（帧）');
+  int('maxCells', 0, 2304, 'localMaxCells', '（格）');
+  if (src.boost !== undefined) {
+    const v = Number(src.boost);
+    const ok = Number.isFinite(v) && v >= 0 && v <= 5;
+    if (!ok) bad.push('local.boost 必须在 0–5 之间（0 = 关掉积分加成）');
+    if (ok) out.localBoost = v;
+  }
+  return { local: out, warnings: bad };
+}
+
+/**
+ * `dedup` 段：跨帧去重的三个阈值（见 pipeline.js 的 dupMin / dupHashDist）。
+ *
+ * `hashDist: 0` 关掉结构判重，`min: 0` 关掉平均分判重 —— 两个都关就等于不去重。
+ */
+function readDedup(raw) {
+  const src = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
+  const out = {};
+  const bad = [];
+  const int = (key, min, max, target) => {
+    if (src[key] === undefined) return;
+    const n = Number(src[key]);
+    const ok = Number.isInteger(n) && n >= min && n <= max;
+    if (!ok) bad.push(`dedup.${key} 必须是 ${min}–${max} 的整数`);
+    if (ok) out[target] = n;
+  };
+  int('min', 0, 64, 'dupMin');
+  int('hashDist', 0, 64, 'dupHashDist');
+  if (src.hashScale !== undefined) {
+    const v = Number(src.hashScale);
+    const ok = Number.isFinite(v) && v >= 1 && v <= 10;
+    if (!ok) bad.push('dedup.hashScale 必须在 1–10 之间');
+    if (ok) out.dupHashScale = v;
+  }
+  return { dedup: out, warnings: bad };
+}
+
 function dshHome(env) {
   return env.DSH_HOME || join(env.USERPROFILE || env.HOME || homedir(), '.dsh');
 }
@@ -291,6 +349,12 @@ export function readTuning({ env = process.env, readFile = readFileSync } = {}) 
   const cropCfg = readCrop(raw.crop);
   warnings.push(...cropCfg.warnings);
 
+  const localCfg = readLocal(raw.local);
+  warnings.push(...localCfg.warnings);
+
+  const dedupCfg = readDedup(raw.dedup);
+  warnings.push(...dedupCfg.warnings);
+
   return {
     maxAutonomousWakes,
     idleStopMin,
@@ -304,6 +368,10 @@ export function readTuning({ env = process.env, readFile = readFileSync } = {}) 
     asr: asrCfg.asr,
     /** 特写几何参数（只含用户真填的键，其余交给 pipeline 的 DEFAULTS）。 */
     crop: cropCfg.crop,
+    /** 局部敏感参数（同上，只含用户真填的键）。 */
+    local: localCfg.local,
+    /** 跨帧去重阈值（同上）。 */
+    dedup: dedupCfg.dedup,
     path,
     warnings,
   };
@@ -314,6 +382,8 @@ export function readTuning({ env = process.env, readFile = readFileSync } = {}) 
 /** 面板能改的顶层键。`idleStopMs` 是派生的，不在这里 —— 传进来会被拒。 */
 export const WRITABLE_KEYS = Object.freeze([
   'maxAutonomousWakes', 'idleStopMin', 'wakeBatch', 'defaultPace', 'speechPacing', 'listen',
+  // 本地加的四段：面板要能改它们，否则用户只能手改 JSON
+  'crop', 'asr', 'local', 'dedup',
 ]);
 
 /** `listen` 段能改的键。 */

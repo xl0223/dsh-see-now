@@ -404,6 +404,9 @@ see_now({ scene: true, say: "好，接下来每换一个画面我就说一句" }
 | `crop` | `{}` | 变化区域特写的几何参数：`{ "zoom": true, "minArea": 0.005, "maxArea": 0.5, "pad": 0.25, "minSide": 0.25 }`。只写想改的键，其余由内置默认兜。`"zoom": false` 完全关掉特写（回到整帧缩放） |
 | `asr` | `{}` | 术语表：`{ "hotwords": ["材质", …], "fixes": { "才质": "材质" }, "autoFix": true }`。`hotwords` 交给转写服务当解码提示（只有 http 后端认），`fixes` 是转写后的精确纠错（**对宿主 SenseVoice 也生效**）。`"hotwords": false` / `"fixes": false` 是明确关掉 |
 
+| `local` | `{}` | 局部敏感：`{ "event": 70, "minCells": 4, "peakMin": 40, "boost": 0, "calmFrames": 6, "maxCells": 120 }`。`event: 0` 关掉一次性出口，`boost` > 0 打开积分加成（默认 0，见下） |
+| `dedup` | `{}` | 跨帧去重：`{ "min": 8, "hashDist": 2, "hashScale": 2 }`。`hashDist: 0` 关掉结构判重，`min: 0` 关掉平均分判重 |
+
 **为什么有 `crop` 和 `asr`**：这两个是本地加的能力，默认值就是"开箱好用"的那一档。
 `crop` 那边，797×450 里塞 4 帧之后每帧只剩 ~398×225，引擎面板的数值、代码的行、
 报错的红字全是糊的 —— 变化区域占 0.5%~50% 时以它为中心裁一块原分辨率出来，
